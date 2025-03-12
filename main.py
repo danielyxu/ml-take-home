@@ -1,22 +1,22 @@
 import transformers as tr
 import multiprocessing as mp
-# mp.set_start_method('fork')
+mp.set_start_method('fork')
 import torch
 import torch.nn.functional as F
-# device = torch.device("mps")
+device = torch.device("mps")
 import concurrent.futures
-
+import math
 from tqdm import tqdm
 
 
-amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-expert_path = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-
-amateur_path = "Qwen/Qwen1.5-0.5B"
-expert_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-
-# expert_path = "Qwen/Qwen2.5-3B-Instruct"
 # amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+# expert_path = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+# amateur_path = "Qwen/Qwen1.5-0.5B"
+# expert_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+
+expert_path = "Qwen/Qwen2.5-3B-Instruct"
+amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 
 tokenizer = tr.AutoTokenizer.from_pretrained(amateur_path)
 
@@ -54,11 +54,12 @@ prompt = tokenizer.apply_chat_template(
 )
 
 
-def contrastive_generation_parallel(amateur: tr.pipeline, 
+def contrastive_generation(amateur: tr.pipeline, 
                                     expert: tr.pipeline,
                                     prompt: str,
                                     max_tokens: int,
-                                    adaptive_plausibility: float = 0.1) -> torch.Tensor:
+                                    adaptive_plausibility: float = 0.1,
+                                    top_k: int = 50) -> torch.Tensor:
     def get_probs(model, generated, past):
         with torch.inference_mode():
             if past is None:
@@ -91,18 +92,21 @@ def contrastive_generation_parallel(amateur: tr.pipeline,
                 amateur_probs, amateur_past = future_amateur.result()
 
                 max_prob = expert_probs.max().item()
-                threshold = adaptive_plausibility * torch.exp(torch.tensor(max_prob, device=device))
+                # threshold = adaptive_plausibility * torch.exp(torch.tensor(max_prob, device=device))
+                threshold = adaptive_plausibility * math.exp(max_prob)
 
                 # create a mask for tokens above the plausibility threshold.
                 candidate_mask = torch.exp(expert_probs) >= threshold
 
-                # compute the contrastive scores.
-                contrastive_scores = torch.where(
-                    candidate_mask,
-                    expert_probs - amateur_probs,
-                    torch.tensor(float('-inf'), device=device)
-                )
-                next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
+                contrastive_scores = (expert_probs - amateur_probs).masked_fill(~candidate_mask, float('-inf'))
+
+                if isinstance(top_k, int) and top_k > 0:
+                    topk_values, topk_indices = torch.topk(contrastive_scores, k=top_k, dim=-1)
+                    topk_probs = F.softmax(topk_values, dim=-1)
+                    sampled_index = torch.multinomial(topk_probs, num_samples=1)
+                    next_token = topk_indices.gather(dim=-1, index=sampled_index)
+                else:
+                    next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
 
                 generated = torch.cat([generated, next_token], dim=-1)
 
