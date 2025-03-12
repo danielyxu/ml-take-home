@@ -4,6 +4,7 @@ import multiprocessing as mp
 import torch
 import torch.nn.functional as F
 # device = torch.device("mps")
+import concurrent.futures
 
 from tqdm import tqdm
 
@@ -53,11 +54,11 @@ prompt = tokenizer.apply_chat_template(
 )
 
 
-def contrastive_generation(amateur: tr.pipeline, 
-                           expert: tr.pipeline,
-                           prompt: str,
-                           max_tokens: int,
-                           adaptive_plausibility: float = .1) -> str:
+def contrastive_generation_parallel(amateur: tr.pipeline, 
+                                    expert: tr.pipeline,
+                                    prompt: str,
+                                    max_tokens: int,
+                                    adaptive_plausibility: float = 0.1) -> torch.Tensor:
     def get_probs(model, generated, past):
         with torch.inference_mode():
             if past is None:
@@ -65,41 +66,47 @@ def contrastive_generation(amateur: tr.pipeline,
             else:
                 last_token = generated[:, -1].unsqueeze(-1)
                 outputs = model.model(last_token, past_key_values=past, use_cache=True)
-            past = outputs.past_key_values
+            new_past = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
             probs = F.log_softmax(logits, dim=-1)
-            return probs
+            return probs, new_past
 
     expert.model.eval()
     amateur.model.eval()
+
     with torch.inference_mode():
         device = next(amateur.model.parameters()).device
         generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
         expert_past = None
         amateur_past = None
-        for _ in tqdm(range(max_tokens)):
-            expert_probs = get_probs(expert, generated, expert_past)
-            amateur_probs = get_probs(amateur, generated, amateur_past)
         
-            max_prob = expert_probs.max().item()
-            threshold = adaptive_plausibility * torch.exp(torch.tensor(max_prob))
+        # parallelize the forward passes
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            for _ in tqdm(range(max_tokens)):
+                future_expert = executor.submit(get_probs, expert, generated, expert_past)
+                future_amateur = executor.submit(get_probs, amateur, generated, amateur_past)
 
-            # create a mask for tokens above the plausibility threshold.
-            candidate_mask = torch.exp(expert_probs) >= threshold
+                expert_probs, expert_past = future_expert.result()
+                amateur_probs, amateur_past = future_amateur.result()
 
-            # compute contrastive scores
-            contrastive_scores = torch.where(
-                candidate_mask,
-                expert_probs - amateur_probs,
-                torch.tensor(float('-inf')).to(expert_probs.device)
-            )
+                max_prob = expert_probs.max().item()
+                threshold = adaptive_plausibility * torch.exp(torch.tensor(max_prob, device=device))
 
-            next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
+                # create a mask for tokens above the plausibility threshold.
+                candidate_mask = torch.exp(expert_probs) >= threshold
 
-            generated = torch.cat([generated, next_token], dim=-1)
+                # compute the contrastive scores.
+                contrastive_scores = torch.where(
+                    candidate_mask,
+                    expert_probs - amateur_probs,
+                    torch.tensor(float('-inf'), device=device)
+                )
+                next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
 
-            if next_token.item() == tokenizer.eos_token_id:
-                break
+                generated = torch.cat([generated, next_token], dim=-1)
+
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
 
     return generated
