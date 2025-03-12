@@ -49,10 +49,43 @@ prompt = tokenizer.apply_chat_template(
     tokenize=False,
 )
 
+
 def contrastive_generation(amateur: tr.pipeline, 
                            expert: tr.pipeline,
                            prompt: str,
-                           max_tokens: int) -> str:
-    amateur_output = amateur(prompt, max_new_tokens=max_tokens)
-    expert_output = expert(prompt, max_new_tokens=max_tokens)
-    return amateur_output, expert_output
+                           max_tokens: int,
+                           adaptive_plausibility: float = .1) -> str:
+
+    device = next(amateur.model.parameters()).device
+
+    generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+
+    for _ in tqdm(range(max_tokens)):
+        expert_outputs = expert.model(generated)
+        expert_logits = expert_outputs.logits[:, -1, :]
+        expert_probs = F.softmax(expert_logits, dim=-1)
+        max_prob = expert_probs.max().item()
+        threshold = adaptive_plausibility * max_prob
+
+        # create a mask for tokens above the plausibility threshold.
+        candidate_mask = expert_probs >= threshold
+
+        amateur_outputs = amateur.model(generated.to(next(amateur.model.parameters()).device))
+        amateur_logits = amateur_outputs.logits[:, -1, :]
+        amateur_probs = F.softmax(amateur_logits, dim=-1)
+
+        # compute contrastive scores
+        contrastive_scores = torch.where(
+            candidate_mask,
+            torch.log(expert_probs) - torch.log(amateur_probs),
+            torch.tensor(float('-inf')).to(expert_probs.device)
+        )
+
+        next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
+
+        generated = torch.cat([generated, next_token], dim=-1)
+
+        if next_token.item() == tokenizer.eos_token_id:
+            break
+
+    return generated
