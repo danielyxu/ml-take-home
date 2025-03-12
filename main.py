@@ -1,7 +1,18 @@
 import transformers as tr
+import multiprocessing as mp
+# mp.set_start_method('fork')
+import torch
+import torch.nn.functional as F
+# device = torch.device("mps")
+
+from tqdm import tqdm
+
 
 amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 expert_path = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
+# expert_path = "Qwen/Qwen2.5-3B-Instruct"
+# amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 
 tokenizer = tr.AutoTokenizer.from_pretrained(amateur_path)
 
@@ -38,6 +49,10 @@ prompt = tokenizer.apply_chat_template(
     tokenize=False,
 )
 
-
-def contrastive_generation(amateur, expert, prompt, max_tokens) -> str:
-    return ""
+def contrastive_generation(amateur: tr.pipeline, 
+                           expert: tr.pipeline,
+                           prompt: str,
+                           max_tokens: int) -> str:
+    amateur_output = amateur(prompt, max_new_tokens=max_tokens)
+    expert_output = expert(prompt, max_new_tokens=max_tokens)
+    return amateur_output, expert_output
