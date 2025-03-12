@@ -11,6 +11,9 @@ from tqdm import tqdm
 amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 expert_path = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
+amateur_path = "Qwen/Qwen1.5-0.5B"
+expert_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+
 # expert_path = "Qwen/Qwen2.5-3B-Instruct"
 # amateur_path = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
 
@@ -55,37 +58,48 @@ def contrastive_generation(amateur: tr.pipeline,
                            prompt: str,
                            max_tokens: int,
                            adaptive_plausibility: float = .1) -> str:
+    def get_probs(model, generated, past):
+        with torch.inference_mode():
+            if past is None:
+                outputs = model.model(generated, use_cache=True)
+            else:
+                last_token = generated[:, -1].unsqueeze(-1)
+                outputs = model.model(last_token, past_key_values=past, use_cache=True)
+            past = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]
+            probs = F.log_softmax(logits, dim=-1)
+            return probs
 
-    device = next(amateur.model.parameters()).device
+    expert.model.eval()
+    amateur.model.eval()
+    with torch.inference_mode():
+        device = next(amateur.model.parameters()).device
+        generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-    generated = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        expert_past = None
+        amateur_past = None
+        for _ in tqdm(range(max_tokens)):
+            expert_probs = get_probs(expert, generated, expert_past)
+            amateur_probs = get_probs(amateur, generated, amateur_past)
+        
+            max_prob = expert_probs.max().item()
+            threshold = adaptive_plausibility * torch.exp(torch.tensor(max_prob))
 
-    for _ in tqdm(range(max_tokens)):
-        expert_outputs = expert.model(generated)
-        expert_logits = expert_outputs.logits[:, -1, :]
-        expert_probs = F.softmax(expert_logits, dim=-1)
-        max_prob = expert_probs.max().item()
-        threshold = adaptive_plausibility * max_prob
+            # create a mask for tokens above the plausibility threshold.
+            candidate_mask = torch.exp(expert_probs) >= threshold
 
-        # create a mask for tokens above the plausibility threshold.
-        candidate_mask = expert_probs >= threshold
+            # compute contrastive scores
+            contrastive_scores = torch.where(
+                candidate_mask,
+                expert_probs - amateur_probs,
+                torch.tensor(float('-inf')).to(expert_probs.device)
+            )
 
-        amateur_outputs = amateur.model(generated.to(next(amateur.model.parameters()).device))
-        amateur_logits = amateur_outputs.logits[:, -1, :]
-        amateur_probs = F.softmax(amateur_logits, dim=-1)
+            next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
 
-        # compute contrastive scores
-        contrastive_scores = torch.where(
-            candidate_mask,
-            torch.log(expert_probs) - torch.log(amateur_probs),
-            torch.tensor(float('-inf')).to(expert_probs.device)
-        )
+            generated = torch.cat([generated, next_token], dim=-1)
 
-        next_token = contrastive_scores.argmax(dim=-1).unsqueeze(0)
-
-        generated = torch.cat([generated, next_token], dim=-1)
-
-        if next_token.item() == tokenizer.eos_token_id:
-            break
+            if next_token.item() == tokenizer.eos_token_id:
+                break
 
     return generated
